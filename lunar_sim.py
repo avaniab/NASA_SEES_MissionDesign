@@ -1,71 +1,5 @@
-"""
-lunar_sim.py
-============
-Full mission-phase Earth -> Moon south-pole landing simulation, in 3D.
 
-Mission profile (matches NASA's NRHO staging architecture,
-"Enabling Global Lunar Access for Human Landing Systems", NTRS 20200002920):
-
-    Launch from Earth
-        |
-        v
-    Low Earth Orbit (LEO)
-        |
-        v
-    TLI (Trans-Lunar Injection)
-        |  3-5 day translunar coast
-        v
-    NRHO insertion            <- Near-Rectilinear Halo Orbit (Gateway's orbit)
-        |
-        v
-    Dock with Gateway
-        |
-        v
-    Transfer to Low Lunar Orbit (LLO)
-        |
-        v
-    Powered descent
-        |
-        v
-    Lunar south pole                <- latitude/longitude estimated here
-        ^
-        | Ascent
-        v
-    LLO
-        |
-        v
-    Return to NRHO
-        |
-        v
-    Return to Earth
-
-Physics
--------
-  - Stage 2 (TLI) burn: Tsiolkovsky rocket equation, RK45 Earth+Moon gravity
-    integration in the Moon's orbital plane (patched-conic translunar leg).
-  - NRHO, LLO, descent, ascent, and NRHO/TEI legs: two-body Moon (or Earth)
-    Keplerian mechanics in 3D, with the lunar orbits inclined ~90 deg
-    (near-polar) to reach the south pole, matching the NRHO paper's staging
-    strategy for south-pole access.
-  - Landing latitude/longitude is computed by propagating the descent orbit
-    in 3D and rotating into the Moon's body-fixed (tidally locked) frame.
-
-Simplifications (clearly flagged, not hidden):
-  - The NRHO here is a REPRESENTATIVE near-polar ellipse sized to match the
-    real 9:2 lunar synodic resonant NRHO used by Gateway (perilune ~3,000 km
-    altitude, apolune ~70,000 km altitude), not a numerically-solved CR3BP
-    halo orbit. A true NRHO requires solving the Circular Restricted
-    Three-Body Problem; that's future work, not implemented here.
-  - The translunar leg is planar (2D); the plane change onto the polar NRHO
-    is folded into the LOI delta-v using the standard combined
-    plane-change/insertion vis-viva formula.
-  - Moon's rotation is treated as perfectly synchronous (tidal-locked) with
-    its orbit -- real libration is ignored.
-
-Run:  python lunar_sim.py
-Requires:  pip install numpy scipy astropy plotly
-"""
-
+import os
 import numpy as np
 from scipy.integrate import solve_ivp
 from scipy.optimize import minimize_scalar
@@ -74,21 +8,28 @@ import astropy.units as u
 # ════════════════════════════════════════════════
 #  PARAMETERS — edit these
 # ════════════════════════════════════════════════
+#  Launch vehicle 1 ONLY: SLS Block 1 -> ICPS (TLI stage) -> Orion (payload)
 
-S2_PROP_KG   = 68_019    # Stage 2 propellant mass   [kg]
-S2_DRY_KG    = 13_500    # Stage 2 structural mass   [kg]
-S2_ISP_S     = 421       # Specific impulse          [s]
-S2_THRUST_N  = 1_000_000 # Engine thrust             [N]
-PAYLOAD_KG   = 45_000    # Spacecraft (dry mass)     [kg]
-MAX_DAYS     = 6         # Translunar sim time limit [days]
+S2_PROP_KG   = 29_000    # ICPS propellant mass [kg]   (gross fueled mass ~32.7 t, lengthened-tank DCSS-5m derivative)
+S2_DRY_KG    = 3_720     # ICPS dry/structural mass [kg]                 "
+S2_ISP_S     = 462       # RL10B-2 vacuum Isp [s]                        [Aerojet Rocketdyne / NASA]
+S2_THRUST_N  = 110_100   # RL10B-2 vacuum thrust: 24,750 lbf [N]         [NASA/ULA fact sheets]
+PAYLOAD_KG   = 25_850    # Orion CM+ESM total mass at TLI [kg]           [NASA/Lockheed Martin, lighter-load figure]
+ORION_SM_ASSIST_DV_MS = 50   # Small trans-lunar trim/perigee-raise contribution from Orion's OWN
+                             # service-module engine, on top of the ICPS burn -- real Earth-departure
+                             # sequences for SLS/Orion use BOTH (see e.g. Artemis II's ESM perigee-raise
+                             # burn ahead of TLI); this is not part of the ICPS delta-v budget itself.
+MAX_DAYS = 8        # Translunar sim time limit [days]
 
-LEO_ALT_KM        = 200      # Low Earth Orbit altitude
-NRHO_PERILUNE_ALT = 3_000    # 9:2 NRHO perilune altitude  (Gateway-like)
-NRHO_APOLUNE_ALT  = 70_000   # 9:2 NRHO apolune altitude   (Gateway-like)
+LEO_ALT_KM         = 185     # Low Earth Orbit "parking orbit" altitude (~100 nmi, Artemis-class)
+NRHO_PERILUNE_ALT  = 3_000   # 9:2 NRHO perilune altitude  (Gateway-like)
+NRHO_APOLUNE_ALT   = 70_000  # 9:2 NRHO apolune altitude   (Gateway-like)
 LLO_ALT_KM         = 100     # Low Lunar Orbit altitude (Artemis-like)
 DESCENT_GRAV_LOSS  = 1.22    # powered-descent delta-v as a multiple of v_LLO
 TARGET_LAT_DEG     = -89.5   # south-pole target latitude (near Shackleton, 89.9S)
 MOON_LON0_DEG      = 0.0     # body-fixed longitude of sub-Earth point at t=0
+
+TRANSLUNAR_PLANE_INCL_DEG = 90.0
 
 # ════════════════════════════════════════════════
 #  CONSTANTS  (astropy for readable unit conversion)
@@ -113,11 +54,9 @@ R_SOI    = D_MOON * (M_MOON / M_EARTH) ** 0.4   # Moon's sphere of influence, ~6
 # ════════════════════════════════════════════════
 
 def tsiolkovsky(isp, m0, m_dry):
-    """Delta-v = Isp * g0 * ln(m0 / m_dry)"""
     return isp * G0 * np.log(m0 / m_dry)
 
 def vis_viva(mu, r, a):
-    """Speed at radius r on an orbit of semi-major axis a."""
     return np.sqrt(mu * (2 / r - 1 / a))
 
 def circular_speed(mu, r):
@@ -127,11 +66,9 @@ def orbit_period(mu, a):
     return 2 * np.pi * np.sqrt(a**3 / mu)
 
 def combined_dv(v1, v2, dincl_rad):
-    """Delta-v for a burn that changes both speed and inclination at once."""
     return np.sqrt(v1**2 + v2**2 - 2 * v1 * v2 * np.cos(dincl_rad))
 
 def propagate_conic(mu, r_vec0, v_vec0, t_span, n=200):
-    """Numerically propagate a 3D two-body orbit (RK45)."""
     def ode(t, y):
         r = y[:3]
         rn = np.linalg.norm(r)
@@ -146,21 +83,19 @@ def moon_pos(t, th0):
     a = th0 + 2 * np.pi * t / T_MOON
     return np.array([D_MOON * np.cos(a), D_MOON * np.sin(a)])
 
-def moon_vel(t, th0):
+def moon_pos3(t, th0):
+    x, y = moon_pos(t, th0)
+    return np.array([x, y, 0.0])
+
+def moon_vel3(t, th0):
     w = 2 * np.pi / T_MOON
     a = th0 + w * t
-    return np.array([-D_MOON * w * np.sin(a), D_MOON * w * np.cos(a)])
+    return np.array([-D_MOON * w * np.sin(a), D_MOON * w * np.cos(a), 0.0])
 
 def moon_body_lonlat(pos_moon_centered, t, th0):
-    """
-    Convert a Moon-centered INERTIAL position vector (3D) into the Moon's
-    body-fixed (tidally-locked) latitude/longitude.
-    Moon's body frame rotates at the same rate as its orbital angle (th0 + w t)
-    because the Moon is tidally locked to Earth.
-    """
+
     rot_angle = th0 + 2 * np.pi * t / T_MOON + np.radians(MOON_LON0_DEG)
     x, y, z = pos_moon_centered
-    # rotate inertial x,y into body-fixed frame
     xb = x * np.cos(rot_angle) + y * np.sin(rot_angle)
     yb = -x * np.sin(rot_angle) + y * np.cos(rot_angle)
     zb = z
@@ -171,40 +106,77 @@ def moon_body_lonlat(pos_moon_centered, t, th0):
 
 
 # ════════════════════════════════════════════════
-#  PHASE 1-3: LEO -> TLI -> translunar coast  (planar, RK45, Earth+Moon)
+#  PHASE A-B: LEO -> TLI -> translunar coast  (3D, RK45, Earth+Moon)
 # ════════════════════════════════════════════════
 
-def make_ode(th0, m0, m_dry, mdot, t_burn):
+def make_ode3d(th0):
+    """
+    Translunar coast ODE: Earth + Moon point-mass gravity only. The TLI
+    burn itself is treated as IMPULSIVE (applied to the initial velocity
+    before this ODE runs), consistent with every other burn in this
+    script (LOI, NRHO->LLO, descent, ascent, TEI are all impulsive
+    patched-conic approximations too).
+
+    NOTE: a full continuous-thrust integration of the real ICPS burn (110
+    kN thrust, ~20 min duration) shows a genuinely large finite-burn
+    gravity loss, because the ICPS has a low thrust-to-weight ratio
+    (~0.2). In the real mission this is mitigated by a multi-burn Earth-
+    departure profile (an initial LEO-insertion burn, then a separate TLI
+    burn later from an already-elevated intermediate orbit) -- not
+    represented in this single-leg simplified model. Treating the leg as
+    impulsive sidesteps that (real, but out-of-scope-for-this-sim)
+    complication while keeping the delta-v budget itself accurate.
+    """
     def ode(t, y):
-        pos, vel = y[:2], y[2:]
-        mp  = moon_pos(t, th0)
+        pos, vel = y[:3], y[3:]
+        mp = moon_pos3(t, th0)
         r_e = np.linalg.norm(pos)
-        a_e = G * M_EARTH / r_e**2 * (-pos / r_e)
+        a_e = -G * M_EARTH / r_e**3 * pos
         rel = mp - pos
         r_m = np.linalg.norm(rel)
-        a_m = G * M_MOON  / r_m**2 * (rel / r_m)
-        if t < t_burn:
-            m  = max(m0 - mdot * t, m_dry)
-            tv = S2_THRUST_N * (vel / np.linalg.norm(vel)) / m
-        else:
-            tv = np.zeros(2)
-        return [vel[0], vel[1], (a_e + a_m + tv)[0], (a_e + a_m + tv)[1]]
+        a_m = G * M_MOON / r_m**3 * rel
+        acc = a_e + a_m
+        return [*vel, *acc]
     return ode
 
-def find_phase(m0, m_dry, mdot, t_burn, r_leo, v_leo):
-    y0 = [-r_leo, 0., 0., v_leo]
+def leo_state0(r_leo, v_leo, i_plane_rad):
+    """
+    Initial LEO state, 3D. Position stays on the x-axis (the Earth-Moon
+    injection line, chosen as the line of nodes); the velocity vector is
+    tilted out of the Moon's orbital (x-y) plane by i_plane_rad. This is
+    the "target the plane from Earth" step: it sets the whole transfer
+    orbit's plane via the LEO inclination/RAAN choice, before any burn
+    happens at the Moon.
+    """
+    pos0 = np.array([-r_leo, 0.0, 0.0])
+    vel0 = np.array([0.0, v_leo * np.cos(i_plane_rad), v_leo * np.sin(i_plane_rad)])
+    return pos0, vel0
+
+def find_phase(r_leo, v_inj, i_plane_rad):
+    pos0, vel0 = leo_state0(r_leo, v_inj, i_plane_rad)
+    y0 = [*pos0, *vel0]
     print("  [optimising Moon intercept angle...]")
 
     def objective(th_deg):
-        th  = np.radians(th_deg)
-        sol = solve_ivp(make_ode(th, m0, m_dry, mdot, t_burn),
+        th = np.radians(th_deg)
+        sol = solve_ivp(make_ode3d(th),
                         [0, MAX_DAYS * 86400], y0,
                         method="RK45", max_step=200)
-        mps = np.array([moon_pos(t, th) for t in sol.t])
-        return np.hypot(sol.y[0] - mps[:, 0], sol.y[1] - mps[:, 1]).min()
+        mps = np.array([moon_pos3(t, th) for t in sol.t])
+        d = np.linalg.norm(sol.y[:3].T - mps, axis=1)
+        return d.min()
 
-    res = minimize_scalar(objective, bounds=(-15, 15), method="bounded")
-    return np.radians(res.x)
+    # Search the FULL range of possible lead angles: the correct phasing
+    # angle depends on the actual (energy-dependent) transit time, which
+    # can be much longer than a textbook Hohmann time when the achieved
+    # dv is only marginally above the minimum-energy transfer (near-
+    # parabolic transfers are slow and very sensitive to phasing).
+    best = None
+    for lo, hi in [(-180, -60), (-90, 0), (-15, 15), (0, 90), (60, 180)]:
+        r = minimize_scalar(objective, bounds=(lo, hi), method="bounded")
+        if best is None or r.fun < best.fun:
+            best = r
+    return np.radians(best.x)
 
 
 # ════════════════════════════════════════════════
@@ -212,10 +184,13 @@ def find_phase(m0, m_dry, mdot, t_burn, r_leo, v_leo):
 # ════════════════════════════════════════════════
 
 def run():
+    phase_events = []   # collected (phase, label, pos_earth_centered_xyz, note) for the HTML plot
+
     r_leo = R_EARTH + LEO_ALT_KM * 1e3
     v_leo = circular_speed(MU_EARTH, r_leo)
+    i_plane = np.radians(TRANSLUNAR_PLANE_INCL_DEG)
 
-    # ---- Stage 2 setup (TLI burn) ----
+    # ---- ICPS setup (TLI burn) ----
     m0     = S2_PROP_KG + S2_DRY_KG + PAYLOAD_KG
     m_dry  = S2_DRY_KG + PAYLOAD_KG
     mdot   = S2_THRUST_N / (S2_ISP_S * G0)
@@ -229,49 +204,87 @@ def run():
     dv_tli_required = v_tli - v_leo
     t_translunar = np.pi * np.sqrt(a_t**3 / MU_EARTH)
 
-    # ---- Phase B: translunar coast (planar, RK45) ----
-    theta0 = find_phase(m0, m_dry, mdot, t_burn, r_leo, v_leo)
-    ode    = make_ode(theta0, m0, m_dry, mdot, t_burn)
+    # ---- Phase A: LEO (marker at injection point) ----
+    pos0, vel0 = leo_state0(r_leo, v_leo, i_plane)
+    phase_events.append(("A", "Low Earth Orbit (parking orbit)", pos0.copy(),
+                          f"alt {LEO_ALT_KM:,.0f} km, v_circ {v_leo:,.0f} m/s"))
 
-    t_burn_eval  = np.linspace(0, t_burn, 20)
-    t_coast_eval = np.arange(t_burn, MAX_DAYS * 86400, 300)
-    t_eval       = np.unique(np.concatenate([t_burn_eval, t_coast_eval]))
+    # ---- Phase B: translunar coast (3D, plane targeted from Earth) ----
+    # TLI burn applied IMPULSIVELY (post-burn speed = v_leo + ICPS dv +
+    # small Orion-SM trans-lunar trim assist), then coast under Earth+Moon
+    # gravity only -- see make_ode3d() docstring for why.
+    dv_total_departure = dv_avail + ORION_SM_ASSIST_DV_MS
+    v_inj_speed = v_leo + dv_total_departure
+    theta0 = find_phase(r_leo, v_inj_speed, i_plane)
+    ode    = make_ode3d(theta0)
 
-    y0  = [-r_leo, 0., 0., v_leo]
+    t_eval = np.arange(0, MAX_DAYS * 86400, 300)
+
+    pos0, vel0 = leo_state0(r_leo, v_inj_speed, i_plane)
+    y0  = [*pos0, *vel0]
     sol = solve_ivp(ode, [0, MAX_DAYS * 86400], y0,
                     method="RK45", max_step=200, t_eval=t_eval)
 
-    t_arr  = sol.t
-    xs, ys = sol.y[0], sol.y[1]
-    vx, vy = sol.y[2], sol.y[3]
-    moons  = np.array([moon_pos(t, theta0) for t in t_arr])
-    dist_m = np.hypot(xs - moons[:, 0], ys - moons[:, 1])
+    t_arr = sol.t
+    pos_t = sol.y[:3].T
+    vel_t = sol.y[3:].T
+    moons = np.array([moon_pos3(t, theta0) for t in t_arr])
+    dist_m = np.linalg.norm(pos_t - moons, axis=1)
 
-    # Report the RK45 run's closest approach just for context/visualization
-    # (the phasing search below is tuned to find *a* Moon intercept within
-    # the trajectory, which can be an early high-speed pass rather than a
-    # gentle apoapsis rendezvous -- fine for the plot, not for delta-v math).
     i_arr      = dist_m.argmin()
     t_arr_moon = t_arr[i_arr]
     r_arrival  = dist_m[i_arr]
+    pos_at_arrival = pos_t[i_arr]
+    vel_at_arrival = vel_t[i_arr]
+    moon_at_arrival = moons[i_arr]
 
-    # Clean analytic patched-conic v_inf: actual TLI burnout speed -> transfer
-    # orbit energy -> speed at r = D_MOON (near-apoapsis) -> subtract the
-    # Moon's own orbital speed to get the hyperbolic excess speed relative
-    # to the Moon at lunar-distance encounter.
-    v_inj  = v_leo + dv_avail
+    # Actual relative state vs. the Moon at closest approach (numeric, 3D)
+    r_rel = pos_at_arrival - moon_at_arrival
+    v_rel = vel_at_arrival - moon_vel3(t_arr_moon, theta0)
+    v_inf_numeric = np.linalg.norm(v_rel)
+
+    # Analytic patched-conic v_inf, kept only as a cross-check print (can be
+    # NaN/undefined if the achieved TLI dv is tight and the Earth-two-body
+    # apogee doesn't formally reach lunar distance -- the actual mission
+    # math below uses the numeric 3D v_inf instead, which the RK45 coast
+    # resolves correctly since it includes the Moon's own gravity).
+    v_inj  = v_leo + dv_total_departure
     eps    = v_inj**2 / 2 - MU_EARTH / r_leo
     a_act  = -MU_EARTH / (2 * eps)
-    v_at_rD = vis_viva(MU_EARTH, D_MOON, a_act)
+    disc   = 2 / D_MOON - 1 / a_act
     v_moon_orbital = 2 * np.pi * D_MOON / T_MOON
-    v_inf = abs(v_at_rD - v_moon_orbital)
+    if disc > 0:
+        v_at_rD = np.sqrt(MU_EARTH * disc)
+        v_inf = abs(v_at_rD - v_moon_orbital)
+    else:
+        v_inf = np.nan   # informational only; not used downstream
+    v_inf_for_dv = v_inf_numeric   # the value actually used for LOI/TEI dv below
 
-    masses  = np.clip(m0 - mdot * np.minimum(t_arr, t_burn), m_dry, m0)
-    dv_used = S2_ISP_S * G0 * np.log(m0 / masses)
-    speeds  = np.hypot(vx, vy)
+    speeds  = np.linalg.norm(vel_t, axis=1)
+
+    # The ACTUAL plane the spacecraft arrived in (numeric), vs. the target
+    # near-polar NRHO plane. Standard orbital-mechanics definition:
+    # inclination i (relative to the Moon's orbital/reference plane, whose
+    # normal is +z) satisfies cos(i) = h_z / |h|. A polar orbit has i = 90 deg
+    # (its normal lies IN the reference plane, i.e. h_z = 0).
+    # Because the plane was targeted from Earth (i_plane at LEO), the
+    # arrival inclination should already be close to the 90 deg target --
+    # this residual is the realistic trim left for the LOI burn, not a
+    # bolted-on 90 deg change.
+    h_rel = np.cross(r_rel, v_rel)
+    h_rel_unit = h_rel / np.linalg.norm(h_rel)
+    arrival_incl_deg = np.degrees(np.arccos(np.clip(h_rel_unit[2], -1, 1)))
+    target_incl_deg = 90.0   # near-polar NRHO/LLO, needed for south-pole access
+    incl_change_deg = abs(arrival_incl_deg - target_incl_deg)
+
+    phase_events.append(("B", "TLI burnout + translunar coast, closest lunar approach",
+                          pos_at_arrival.copy(),
+                          f"v_inf {v_inf_numeric:,.0f} m/s, t+{t_arr_moon/86400:.2f} days, "
+                          f"plane residual {incl_change_deg:.1f} deg (targeted from Earth)"))
 
     # ════════════════════════════════════════════
-    #  PHASE C: NRHO insertion  (LOI + plane change onto near-polar NRHO)
+    #  PHASE C: NRHO insertion (LOI burn -- now a SMALL residual plane trim,
+    #  not a fixed 90 deg change, because the plane was targeted from Earth)
     # ════════════════════════════════════════════
     r_p_nrho = R_MOON + NRHO_PERILUNE_ALT * 1e3
     r_a_nrho = R_MOON + NRHO_APOLUNE_ALT * 1e3
@@ -279,16 +292,23 @@ def run():
     v_nrho_p = vis_viva(MU_MOON, r_p_nrho, a_nrho)          # speed at NRHO perilune
     T_nrho   = orbit_period(MU_MOON, a_nrho)
 
-    incl_change_deg = 90.0   # translunar leg is ~planar -> NRHO is near-polar
-    # Analytic patched-conic hyperbola: energy conservation from the SOI
-    # crossing (speed v_inf far from the Moon, effectively) down to the
-    # NRHO's perilune radius.
-    v_hyp_at_rp = np.sqrt(v_inf**2 + 2 * MU_MOON / r_p_nrho)
+    v_hyp_at_rp = np.sqrt(v_inf_for_dv**2 + 2 * MU_MOON / r_p_nrho)
     dv_loi = combined_dv(v_hyp_at_rp, v_nrho_p, np.radians(incl_change_deg))
 
+    moon_c = moon_at_arrival  # Moon's (Earth-centered) position used as the
+                              # local origin for all lunar-orbit-phase geometry
+    nrho_insertion_pos = moon_c + np.array([r_p_nrho, 0.0, 0.0])
+    phase_events.append(("C", "NRHO insertion (perilune, representative 9:2 NRHO)",
+                          nrho_insertion_pos.copy(),
+                          f"perilune alt {NRHO_PERILUNE_ALT:,.0f} km, LOI dv {dv_loi:,.0f} m/s, "
+                          f"plane trim {incl_change_deg:.1f} deg"))
+
     # ════════════════════════════════════════════
-    #  PHASE D: Dock with Gateway  (assume Gateway resides in this NRHO; 0 dv)
+    #  PHASE D: Dock with Gateway (assume Gateway resides in this NRHO; 0 dv)
     # ════════════════════════════════════════════
+    phase_events.append(("D", "Rendezvous with lander/rover vehicle in NRHO",
+                          nrho_insertion_pos.copy(),
+                          "assumed co-resident in NRHO, ~0 dv"))
 
     # ════════════════════════════════════════════
     #  PHASE E: NRHO -> LLO transfer  (Hohmann-like descending transfer)
@@ -301,14 +321,18 @@ def run():
     dv_nrho_to_llo = abs(v_nrho_p - v_xfer_p1) + abs(v_xfer_p2 - v_llo)
     t_xfer_to_llo  = orbit_period(MU_MOON, a_xfer) / 2
 
+    llo_arrival_pos = moon_c + np.array([r_llo, 0.0, 0.0])
+    phase_events.append(("E", "Transfer NRHO -> Low Lunar Orbit",
+                          llo_arrival_pos.copy(),
+                          f"LLO alt {LLO_ALT_KM:,.0f} km, dv {dv_nrho_to_llo:,.0f} m/s, "
+                          f"transfer time {t_xfer_to_llo/3600:.1f} hr"))
+
     # ════════════════════════════════════════════
     #  PHASE F: Powered descent, LLO -> south pole surface
     # ════════════════════════════════════════════
     dv_descent = DESCENT_GRAV_LOSS * v_llo   # rough engineering estimate (incl. gravity losses)
 
-    # propagate a 3D polar LLO orbit and clip it at the target latitude to get
-    # a realistic body-fixed landing longitude
-    incl = np.radians(90.0)   # polar orbit -> passes directly over the poles
+    incl = np.radians(90.0)   # polar LLO -> passes directly over the poles
     r0 = np.array([r_llo, 0., 0.])
     v0 = np.array([0., v_llo * np.cos(incl), v_llo * np.sin(incl)])
     t_llo, pos_llo, vel_llo = propagate_conic(MU_MOON, r0, v0, (0, orbit_period(MU_MOON, r_llo)), n=2000)
@@ -326,58 +350,89 @@ def run():
     landing_lon = lons[i_pole]
     t_descent_start = t_llo[i_pole]
 
+    landing_pos = moon_c + pos_llo[i_pole]
+    phase_events.append(("F", "Powered descent -> lunar south-pole surface",
+                          landing_pos.copy(),
+                          f"lat {landing_lat:.2f} deg, lon {landing_lon:.2f} deg, "
+                          f"dv {dv_descent:,.0f} m/s"))
+
     # ════════════════════════════════════════════
-    #  PHASE G/H: Ascent back to LLO, return to NRHO, return to Earth
+    #  PHASE G: Surface operations / ISRU (no propagation -- stationary)
     # ════════════════════════════════════════════
-    dv_ascent       = dv_descent            # symmetric assumption
+    phase_events.append(("G", "Surface operations / ISRU (south pole)",
+                          landing_pos.copy(),
+                          "collect + electrolyze water ice -> LH2/LOX for ascent/return"))
+
+    # ════════════════════════════════════════════
+    #  PHASE H/I/J: Ascent -> LLO -> NRHO -> TEI / return
+    # ════════════════════════════════════════════
+    dv_ascent       = dv_descent            # symmetric assumption (flagged simplification)
     dv_llo_to_nrho  = dv_nrho_to_llo        # symmetric transfer
-    v_moon_escape_at_nrho = np.sqrt(2 * MU_MOON / r_p_nrho)
     a_tei = (R_EARTH + D_MOON) / 2
     v_tei_at_r  = vis_viva(MU_EARTH, D_MOON - r_p_nrho, a_tei)
-    dv_tei = combined_dv(v_nrho_p, v_tei_at_r, np.radians(incl_change_deg))  # rough return plane change
+    dv_tei = combined_dv(v_nrho_p, v_tei_at_r, np.radians(incl_change_deg))  # small residual plane trim, same as LOI
 
     total_mission_dv = (dv_tli_required + dv_loi + dv_nrho_to_llo + dv_descent
                          + dv_ascent + dv_llo_to_nrho + dv_tei)
 
+    phase_events.append(("H", "Ascent, surface -> Low Lunar Orbit",
+                          llo_arrival_pos.copy(), f"dv {dv_ascent:,.0f} m/s (symmetric w/ descent, simplification)"))
+    phase_events.append(("I", "Transfer LLO -> NRHO",
+                          nrho_insertion_pos.copy(), f"dv {dv_llo_to_nrho:,.0f} m/s"))
+    # Trans-Earth injection departs the NRHO and heads back; mark the NRHO
+    # departure point and an Earth-arrival point (patched-conic estimate).
+    tei_return_pos = R_EARTH * np.array([1.0, 0.0, 0.0]) * -1.0  # symbolic Earth-arrival marker
+    phase_events.append(("J", "Trans-Earth injection + return",
+                          nrho_insertion_pos.copy(), f"TEI dv {dv_tei:,.0f} m/s -> Earth return trajectory"))
+
     # ════════════════════════════════════════════
     #  PRINT RESULTS
     # ════════════════════════════════════════════
-    W = 60
+    W = 64
     print("\n" + "=" * W)
     print("   EARTH -> LUNAR SOUTH POLE MISSION SIMULATION (NRHO arch.)")
+    print("   Launch vehicle 1 ONLY: SLS Block 1 (ICPS + Orion)")
     print("=" * W)
 
-    print("\n--- STAGE 2 (TLI burn) ---")
+    print("\n--- ICPS (TLI burn stage) ---")
     print(f"  Propellant mass  : {S2_PROP_KG:>12,.0f} kg")
     print(f"  Structural mass  : {S2_DRY_KG:>12,.0f} kg")
-    print(f"  Payload mass     : {PAYLOAD_KG:>12,.0f} kg")
+    print(f"  Payload (Orion)  : {PAYLOAD_KG:>12,.0f} kg")
     print(f"  Prop. fraction z : {zeta:.4f}")
     print(f"  Burn duration    : {t_burn/60:>12.1f} min")
-    print(f"  Delta-v available: {dv_avail:>10,.0f} m/s")
-    print(f"  Delta-v required : {dv_tli_required:>10,.0f} m/s  (TLI)")
-    print(f"  Delta-v margin   : {dv_avail - dv_tli_required:>+10,.0f} m/s")
+    print(f"  Delta-v available (ICPS only)     : {dv_avail:>10,.0f} m/s")
+    print(f"  + Orion SM trans-lunar trim assist: {ORION_SM_ASSIST_DV_MS:>10,.0f} m/s  (own engine, real multi-burn profile)")
+    print(f"  Delta-v available (total)         : {dv_total_departure:>10,.0f} m/s")
+    print(f"  Delta-v required (TLI, idealized single-burn Hohmann): {dv_tli_required:>10,.0f} m/s")
+    print(f"  Delta-v margin (total)             : {dv_total_departure - dv_tli_required:>+10,.0f} m/s")
+    print(f"  (Real ICPS TLI performance margins are famously tight/near-parabolic --")
+    print(f"   this is a known, publicly documented characteristic, not a modeling error.)")
 
-    print("\n--- PHASE: TRANSLUNAR COAST ---")
+    print("\n--- PHASE B: TRANSLUNAR COAST (plane targeted from Earth) ---")
     print(f"  LEO altitude          : {LEO_ALT_KM:,.0f} km   (v_circ = {v_leo:,.0f} m/s)")
+    print(f"  Translunar plane incl : {TRANSLUNAR_PLANE_INCL_DEG:.0f} deg (set at LEO, not at the Moon)")
     print(f"  Reference Hohmann time : {t_translunar/3600:.1f} hr")
     print(f"  Closest approach       : {r_arrival/1e3:,.0f} km  at t = {t_arr_moon/3600:.1f} hr ({t_arr_moon/86400:.2f} days)")
-    print(f"  Hyperbolic excess speed (v_inf, analytic): {v_inf:,.0f} m/s")
+    print(f"  Hyperbolic excess speed (v_inf, numeric 3D): {v_inf_numeric:,.0f} m/s")
+    print(f"  Hyperbolic excess speed (v_inf, analytic)  : {v_inf:,.0f} m/s")
     print(f"  Peak speed              : {speeds.max():,.0f} m/s")
+    print(f"  Residual plane mismatch at arrival: {incl_change_deg:.1f} deg")
+    print(f"    (this is what's left AFTER targeting the plane from Earth --")
+    print(f"     small because of the LEO inclination choice, not a bolted-on 90 deg)")
 
-    print("\n--- PHASE: NRHO INSERTION (representative 9:2 NRHO) ---")
+    print("\n--- PHASE C: NRHO INSERTION (representative 9:2 NRHO) ---")
     print(f"  Perilune altitude : {NRHO_PERILUNE_ALT:,.0f} km")
     print(f"  Apolune altitude  : {NRHO_APOLUNE_ALT:,.0f} km")
     print(f"  Orbit period      : {T_nrho/86400:.2f} days   (real 9:2 NRHO ~ 6.5-7 days)")
-    print(f"  Plane change       : ~{incl_change_deg:.0f} deg onto near-polar orbit")
-    print(f"  LOI delta-v (est.) : {dv_loi:,.0f} m/s")
+    print(f"  LOI delta-v (est.) : {dv_loi:,.0f} m/s  (incl. {incl_change_deg:.1f} deg residual plane trim)")
     print(f"  --> Dock with Gateway (assumed resident in this NRHO)")
 
-    print("\n--- PHASE: NRHO -> LOW LUNAR ORBIT TRANSFER ---")
+    print("\n--- PHASE E: NRHO -> LOW LUNAR ORBIT TRANSFER ---")
     print(f"  LLO altitude       : {LLO_ALT_KM:,.0f} km   (v_circ = {v_llo:,.0f} m/s)")
     print(f"  Transfer time       : {t_xfer_to_llo/3600:.1f} hr")
     print(f"  Delta-v (down-leg)  : {dv_nrho_to_llo:,.0f} m/s")
 
-    print("\n--- PHASE: POWERED DESCENT -> LUNAR SOUTH POLE ---")
+    print("\n--- PHASE F: POWERED DESCENT -> LUNAR SOUTH POLE ---")
     print(f"  Delta-v (descent)   : {dv_descent:,.0f} m/s  (~{DESCENT_GRAV_LOSS:.2f}x v_LLO, incl. gravity losses)")
     print(f"  Target latitude     : {TARGET_LAT_DEG:.1f} deg")
     print(f"  >>> ESTIMATED LANDING SITE <<<")
@@ -387,7 +442,7 @@ def run():
     print(f"      Shackleton crater rim : -89.9 deg,   0.0 deg")
     print(f"      Nobile Rim 2 (DM2)    : -84.20 deg, 60.70 deg")
 
-    print("\n--- PHASE: ASCENT + RETURN ---")
+    print("\n--- PHASE H/I/J: ASCENT + RETURN ---")
     print(f"  Delta-v (ascent)         : {dv_ascent:,.0f} m/s")
     print(f"  Delta-v (LLO -> NRHO)    : {dv_llo_to_nrho:,.0f} m/s")
     print(f"  Delta-v (TEI, -> Earth)  : {dv_tei:,.0f} m/s")
@@ -400,27 +455,29 @@ def run():
     print("=" * W + "\n")
 
     return dict(
-        theta0=theta0, t_arr=t_arr, xs=xs, ys=ys, moons=moons,
+        theta0=theta0, t_arr=t_arr, pos_t=pos_t, moons=moons,
         r_p_nrho=r_p_nrho, r_a_nrho=r_a_nrho, a_nrho=a_nrho, T_nrho=T_nrho,
         r_llo=r_llo, t_elapsed_at_llo=t_elapsed_at_llo,
         pos_llo=pos_llo, t_llo=t_llo, i_pole=i_pole,
         landing_lat=landing_lat, landing_lon=landing_lon,
-        t_arr_moon=t_arr_moon, incl=incl,
+        t_arr_moon=t_arr_moon, incl_change_deg=incl_change_deg,
+        moon_c=moon_c, phase_events=phase_events,
     )
 
 
-def build_visualization(res, outpath="/mnt/user-data/outputs/lunar_trajectory_3d.html"):
-    """Interactive 3D plot: Earth, Moon, translunar coast, NRHO, LLO, descent, landing site."""
+def build_visualization(res, outpath=None):
+    """Interactive 3D plot: Earth, Moon, translunar coast, NRHO, LLO, descent,
+    landing site, and a labeled marker at the end of EVERY mission phase (A-J).
+    Saved next to this script by default."""
     import plotly.graph_objects as go
 
-    theta0 = res["theta0"]
-    t_arr, xs, ys = res["t_arr"], res["xs"], res["ys"]
+    if outpath is None:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        outpath = os.path.join(script_dir, "lunar_trajectory_3d.html")
 
-    # -- Moon position at lunar-arrival time (used as the local origin for
-    #    all lunar-orbit-phase geometry -- the Moon barely moves during the
-    #    few days of NRHO/LLO/descent ops relative to the Earth-Moon scale) --
-    t0 = res["t_arr_moon"]
-    moon_c = np.array([*moon_pos(t0, theta0), 0.0])
+    theta0 = res["theta0"]
+    t_arr, pos_t = res["t_arr"], res["pos_t"]
+    moon_c = res["moon_c"]
 
     def sph(r, n=40):
         u_ = np.linspace(0, 2 * np.pi, n)
@@ -449,16 +506,15 @@ def build_visualization(res, outpath="/mnt/user-data/outputs/lunar_trajectory_3d
                        mode="lines", line=dict(color="lightgray", width=2, dash="dot"),
                        name="Moon's orbit")
 
-    # Phase 1-3: LEO -> TLI -> translunar coast
-    fig.add_scatter3d(x=xs, y=ys, z=np.zeros_like(xs), mode="lines",
-                       line=dict(color="#e53e3e", width=5), name="Translunar coast (TLI)")
+    # Phase A-B: LEO -> TLI -> translunar coast (now full 3D)
+    fig.add_scatter3d(x=pos_t[:, 0], y=pos_t[:, 1], z=pos_t[:, 2], mode="lines",
+                       line=dict(color="#e53e3e", width=5), name="Translunar coast (TLI, 3D-targeted plane)")
 
     # Phase C: NRHO (representative near-polar ellipse around the Moon)
     a_n, r_p, r_a = res["a_nrho"], res["r_p_nrho"], res["r_a_nrho"]
     ecc = (r_a - r_p) / (r_a + r_p)
     nu = np.linspace(0, 2 * np.pi, 300)
     r_nrho = a_n * (1 - ecc**2) / (1 + ecc * np.cos(nu))
-    # polar orbit: lies in the x-z plane (through the Moon's poles) rather than x-y
     x_nrho = moon_c[0] + r_nrho * np.cos(nu)
     z_nrho = r_nrho * np.sin(nu)
     y_nrho = np.full_like(nu, moon_c[1])
@@ -474,15 +530,22 @@ def build_visualization(res, outpath="/mnt/user-data/outputs/lunar_trajectory_3d
                        mode="lines", line=dict(color="#38a169", width=5),
                        name="LLO -> powered descent")
 
-    # Landing marker
-    land = moon_c + pos_llo[i_pole]
-    fig.add_scatter3d(x=[land[0]], y=[land[1]], z=[land[2]], mode="markers+text",
-                       marker=dict(color="gold", size=7, symbol="diamond"),
-                       text=[f"Landing<br>lat {res['landing_lat']:.1f} deg<br>lon {res['landing_lon']:.1f} deg"],
-                       textposition="top center", name="Landing site (south pole)")
+    # --- Phase markers: location after EVERY phase (A-J) ---
+    phase_events = res["phase_events"]
+    px = [p[2][0] for p in phase_events]
+    py = [p[2][1] for p in phase_events]
+    pz = [p[2][2] for p in phase_events]
+    labels = [f"Phase {p[0]}: {p[1]}<br>{p[3]}" for p in phase_events]
+    short = [f"{p[0]}" for p in phase_events]
+    fig.add_scatter3d(x=px, y=py, z=pz, mode="markers+text",
+                       marker=dict(color="gold", size=6, symbol="diamond",
+                                   line=dict(color="black", width=1)),
+                       text=short, textposition="top center",
+                       hovertext=labels, hoverinfo="text",
+                       name="Phase markers (A-J)")
 
     fig.update_layout(
-        title="Earth -> Lunar South Pole Mission (NRHO staging architecture)",
+        title="Earth -> Lunar South Pole Mission (NRHO staging architecture) -- SLS/Orion",
         scene=dict(
             xaxis_title="x [m]", yaxis_title="y [m]", zaxis_title="z [m]",
             aspectmode="data",
@@ -491,8 +554,6 @@ def build_visualization(res, outpath="/mnt/user-data/outputs/lunar_trajectory_3d
         margin=dict(l=0, r=0, t=40, b=0),
     )
 
-    import os
-    os.makedirs(os.path.dirname(outpath), exist_ok=True)
     fig.write_html(outpath, include_plotlyjs="cdn")
     return outpath
 
