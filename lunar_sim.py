@@ -3,7 +3,7 @@ import os
 import numpy as np
 from scipy.integrate import solve_ivp
 from scipy.optimize import minimize_scalar
-import astropy.units as u
+import astropy.units as u 
 
 # ════════════════════════════════════════════════
 #  PARAMETERS — edit these
@@ -116,23 +116,6 @@ def moon_body_lonlat(pos_moon_centered, t, th0):
 # ════════════════════════════════════════════════
 
 def make_ode3d(th0):
-    """
-    Translunar coast ODE: Earth + Moon point-mass gravity only. The TLI
-    burn itself is treated as IMPULSIVE (applied to the initial velocity
-    before this ODE runs), consistent with every other burn in this
-    script (LOI, NRHO->LLO, descent, ascent, TEI are all impulsive
-    patched-conic approximations too).
-
-    NOTE: a full continuous-thrust integration of the real ICPS burn (110
-    kN thrust, ~20 min duration) shows a genuinely large finite-burn
-    gravity loss, because the ICPS has a low thrust-to-weight ratio
-    (~0.2). In the real mission this is mitigated by a multi-burn Earth-
-    departure profile (an initial LEO-insertion burn, then a separate TLI
-    burn later from an already-elevated intermediate orbit) -- not
-    represented in this single-leg simplified model. Treating the leg as
-    impulsive sidesteps that (real, but out-of-scope-for-this-sim)
-    complication while keeping the delta-v budget itself accurate.
-    """
     def ode(t, y):
         pos, vel = y[:3], y[3:]
         mp = moon_pos3(t, th0)
@@ -172,11 +155,6 @@ def find_phase(r_leo, v_inj, i_plane_rad):
         d = np.linalg.norm(sol.y[:3].T - mps, axis=1)
         return d.min()
 
-    # Search the FULL range of possible lead angles: the correct phasing
-    # angle depends on the actual (energy-dependent) transit time, which
-    # can be much longer than a textbook Hohmann time when the achieved
-    # dv is only marginally above the minimum-energy transfer (near-
-    # parabolic transfers are slow and very sensitive to phasing).
     best = None
     for lo, hi in [(-180, -60), (-90, 0), (-15, 15), (0, 90), (60, 180)]:
         r = minimize_scalar(objective, bounds=(lo, hi), method="bounded")
@@ -249,11 +227,6 @@ def run():
     v_rel = vel_at_arrival - moon_vel3(t_arr_moon, theta0)
     v_inf_numeric = np.linalg.norm(v_rel)
 
-    # Analytic patched-conic v_inf, kept only as a cross-check print (can be
-    # NaN/undefined if the achieved TLI dv is tight and the Earth-two-body
-    # apogee doesn't formally reach lunar distance -- the actual mission
-    # math below uses the numeric 3D v_inf instead, which the RK45 coast
-    # resolves correctly since it includes the Moon's own gravity).
     v_inj  = v_leo + dv_total_departure
     eps    = v_inj**2 / 2 - MU_EARTH / r_leo
     a_act  = -MU_EARTH / (2 * eps)
@@ -268,15 +241,7 @@ def run():
 
     speeds  = np.linalg.norm(vel_t, axis=1)
 
-    # The ACTUAL plane the spacecraft arrived in (numeric), vs. the target
-    # near-polar NRHO plane. Standard orbital-mechanics definition:
-    # inclination i (relative to the Moon's orbital/reference plane, whose
-    # normal is +z) satisfies cos(i) = h_z / |h|. A polar orbit has i = 90 deg
-    # (its normal lies IN the reference plane, i.e. h_z = 0).
-    # Because the plane was targeted from Earth (i_plane at LEO), the
-    # arrival inclination should already be close to the 90 deg target --
-    # this residual is the realistic trim left for the LOI burn, not a
-    # bolted-on 90 deg change.
+    # The ACTUAL plane the spacecraft arrived in (numeric), vs. the target near-polar NRHO plane. Standard orbital-mechanics definition:
     h_rel = np.cross(r_rel, v_rel)
     h_rel_unit = h_rel / np.linalg.norm(h_rel)
     arrival_incl_deg = np.degrees(np.arccos(np.clip(h_rel_unit[2], -1, 1)))
@@ -536,7 +501,7 @@ def build_visualization(res, outpath=None):
                        mode="lines", line=dict(color="#38a169", width=5),
                        name="LLO -> powered descent")
 
-    # --- Phase markers: location after EVERY phase (A-J) ---
+    # Phase markers: location after EVERY phase (A-J) ---
     phase_events = res["phase_events"]
     px = [p[2][0] for p in phase_events]
     py = [p[2][1] for p in phase_events]
