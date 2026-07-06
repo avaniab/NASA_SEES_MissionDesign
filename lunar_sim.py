@@ -10,6 +10,11 @@ import astropy.units as u
 # ════════════════════════════════════════════════
 #  Launch vehicle 1 ONLY: SLS Block 1 -> ICPS (TLI stage) -> Orion (payload)
 
+#TODO : add a second launch vehicle (SLS Block 1B) to carry a lander/rover
+#TODO : NRHO dock w/ falcon heavy is more feasable than to LLO so change that
+#TODO v_inf is brocken must fix
+#TODO : plane change is over simplified - 3 body 
+
 S2_PROP_KG   = 29_000    # ICPS propellant mass [kg]   (gross fueled mass ~32.7 t, lengthened-tank DCSS-5m derivative)
 S2_DRY_KG    = 3_720     # ICPS dry/structural mass [kg]                 "
 S2_ISP_S     = 462       # RL10B-2 vacuum Isp [s]                        [Aerojet Rocketdyne / NASA]
