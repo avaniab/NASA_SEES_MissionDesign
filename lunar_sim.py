@@ -14,6 +14,7 @@ import astropy.units as u
 #TODO : NRHO dock w/ falcon heavy is more feasable than to LLO so change that
 #TODO v_inf is brocken must fix
 #TODO : plane change is over simplified - 3 body 
+#TODO - PRIORITY assume no refueling so much carry capacity to go and come back 
 
 S2_PROP_KG   = 29_000    # ICPS propellant mass [kg]   (gross fueled mass ~32.7 t, lengthened-tank DCSS-5m derivative)
 S2_DRY_KG    = 3_720     # ICPS dry/structural mass [kg]                 "
