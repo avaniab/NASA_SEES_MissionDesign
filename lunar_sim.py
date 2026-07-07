@@ -11,8 +11,8 @@ import astropy.units as u
 #  Launch vehicle 1 ONLY: SLS Block 1 -> ICPS (TLI stage) -> Orion (payload)
 
 #TODO : add a second launch vehicle (SLS Block 1B) to carry a lander/rover
-#TODO : NRHO dock w/ falcon heavy is more feasable than to LLO so change that
-#TODO v_inf is brocken must fix
+#TODO : NRHO dock w/ second vessel is more feasable than to LLO so change that 
+#TODO v_inf is brocken must fix 
 #TODO : plane change is over simplified - 3 body 
 #TODO - PRIORITY assume no refueling so much carry capacity to go and come back 
 
